@@ -51,6 +51,7 @@ type MinutePayload = {
 };
 
 const PAGE_SIZE = 18;
+const DATA_BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const SEALED = "#2f6ea3";
 const OPENED = "#e0785c";
 
@@ -385,7 +386,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     let active = true;
-    fetch("/data/events.json")
+    fetch(`${DATA_BASE}/data/events.json`)
       .then((response) => {
         if (!response.ok) throw new Error(`数据请求失败：${response.status}`);
         return response.json() as Promise<CompactPayload>;
@@ -424,7 +425,7 @@ export default function Dashboard() {
     setMinuteLoading(true);
     setMinuteError("");
     setMinuteStocks(new Map());
-    fetch(`/data/minutes/${selectedDate}.json`, { signal: controller.signal })
+    fetch(`${DATA_BASE}/data/minutes/${selectedDate}.json`, { signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`分钟行情请求失败：${response.status}`);
         return response.json() as Promise<MinutePayload>;

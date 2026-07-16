@@ -35,6 +35,10 @@ npm run dev
 npm run build
 ```
 
+## GitHub Pages
+
+仓库包含 `.github/workflows/deploy-pages.yml`。推送到默认分支后，GitHub Actions 会自动执行静态导出并部署 Pages。项目仓库和 `<用户名>.github.io` 仓库都会自动使用正确的访问路径。
+
 ## 个股图表口径
 
 - 价格区：分钟最高价、最低价和收盘价，并显示昨收价与理论涨停价
