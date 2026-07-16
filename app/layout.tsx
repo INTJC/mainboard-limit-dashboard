@@ -8,7 +8,7 @@ export async function generateMetadata(): Promise<Metadata> {
   const protocol = requestHeaders.get("x-forwarded-proto") ?? (host.startsWith("localhost") ? "http" : "https");
   const origin = `${protocol}://${host}`;
   const title = "主板涨停观察台";
-  const description = "按交易日查看沪深主板 10% 触板曲线、封板结果与事件明细。";
+  const description = "按交易日查看沪深主板 10% 触板节奏，并分析个股分钟价格、成交量与成交额曲线。";
 
   return {
     metadataBase: new URL(origin),

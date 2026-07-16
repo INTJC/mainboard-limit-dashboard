@@ -33,6 +33,23 @@ type CompactPayload = {
   events: Array<Array<string | number | null>>;
 };
 
+type MinutePoint = {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  amount: number;
+};
+
+type MinutePayload = {
+  date: string;
+  point_fields: string[];
+  stock_count: number;
+  stocks: Array<[string, Array<Array<string | number | null>>]>;
+};
+
 const PAGE_SIZE = 18;
 const SEALED = "#2f6ea3";
 const OPENED = "#e0785c";
@@ -44,6 +61,23 @@ function inflatePayload(payload: CompactPayload): LimitEvent[] {
     );
     return record as LimitEvent;
   });
+}
+
+function inflateMinutePayload(payload: MinutePayload) {
+  return new Map<string, MinutePoint[]>(
+    payload.stocks.map(([code, rows]) => [
+      code,
+      rows.map((row) => ({
+        time: String(row[0] ?? ""),
+        open: Number(row[1]),
+        high: Number(row[2]),
+        low: Number(row[3]),
+        close: Number(row[4]),
+        volume: Number(row[5]),
+        amount: Number(row[6]),
+      })),
+    ]),
+  );
 }
 
 function dateInputValue(date: string) {
@@ -89,6 +123,12 @@ function formatPercent(value: number) {
 function timeIndex(timestamp: string) {
   const hour = Number(timestamp.slice(11, 13));
   const minute = Number(timestamp.slice(14, 16));
+  const absolute = hour * 60 + minute;
+  return absolute < 13 * 60 ? absolute - 570 : 121 + (absolute - 780);
+}
+
+function minuteTimeIndex(time: string) {
+  const [hour, minute] = time.split(":").map(Number);
   const absolute = hour * 60 + minute;
   return absolute < 13 * 60 ? absolute - 570 : 121 + (absolute - 780);
 }
@@ -192,6 +232,144 @@ function CumulativeChart({ events }: { events: LimitEvent[] }) {
   );
 }
 
+function StockIntradayChart({ event, points }: { event: LimitEvent; points: MinutePoint[] }) {
+  const [activeIndex, setActiveIndex] = useState(Math.max(0, points.length - 1));
+  const width = 1120;
+  const height = 650;
+  const margin = { left: 68, right: 24 };
+  const innerWidth = width - margin.left - margin.right;
+  const priceTop = 28;
+  const priceHeight = 300;
+  const volumeTop = 388;
+  const volumeHeight = 82;
+  const amountTop = 525;
+  const amountHeight = 82;
+
+  useEffect(() => setActiveIndex(Math.max(0, points.length - 1)), [points]);
+
+  const priceValues = points.flatMap((point) => [point.low, point.high]);
+  priceValues.push(event.reference_close, event.limit_price);
+  const rawMin = Math.min(...priceValues);
+  const rawMax = Math.max(...priceValues);
+  const pricePadding = Math.max(0.01, (rawMax - rawMin) * 0.06);
+  const priceMin = rawMin - pricePadding;
+  const priceMax = rawMax + pricePadding;
+  const maxVolume = Math.max(1, ...points.map((point) => point.volume));
+  const maxAmount = Math.max(1, ...points.map((point) => point.amount));
+  const x = (time: string) => margin.left + (minuteTimeIndex(time) / 241) * innerWidth;
+  const yPrice = (value: number) =>
+    priceTop + priceHeight - ((value - priceMin) / (priceMax - priceMin)) * priceHeight;
+  const yVolume = (value: number) => volumeTop + volumeHeight - (value / maxVolume) * volumeHeight;
+  const yAmount = (value: number) => amountTop + amountHeight - (value / maxAmount) * amountHeight;
+  const linePath = (value: (point: MinutePoint) => number, y: (value: number) => number) =>
+    points.map((point, index) => `${index ? "L" : "M"} ${x(point.time)} ${y(value(point))}`).join(" ");
+  const areaPath = (value: (point: MinutePoint) => number, y: (value: number) => number, baseline: number) => {
+    if (!points.length) return "";
+    return `${linePath(value, y)} L ${x(points.at(-1)!.time)} ${baseline} L ${x(points[0].time)} ${baseline} Z`;
+  };
+  const priceTicks = [priceMin, (priceMin + priceMax) / 2, priceMax];
+  const timeTicks = ["09:30", "10:00", "10:30", "11:00", "11:30", "13:00", "13:30", "14:00", "14:30", "15:00"];
+  const firstTouch = timeOnly(event.first_touch_time);
+  const touchPoint = points.find((point) => point.time === firstTouch);
+  const activePoint = points[Math.min(activeIndex, points.length - 1)] ?? points[0];
+
+  const updateActivePoint = (clientX: number, svg: SVGSVGElement) => {
+    const bounds = svg.getBoundingClientRect();
+    const chartX = ((clientX - bounds.left) / bounds.width) * width;
+    let nearest = 0;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+    points.forEach((point, index) => {
+      const distance = Math.abs(x(point.time) - chartX);
+      if (distance < nearestDistance) {
+        nearest = index;
+        nearestDistance = distance;
+      }
+    });
+    setActiveIndex(nearest);
+  };
+
+  return (
+    <div className="stock-chart-wrap">
+      <div className="stock-chart-legend" aria-label="价格图例">
+        <span><i className="legend-close" />收盘价</span>
+        <span><i className="legend-high" />最高价</span>
+        <span><i className="legend-low" />最低价</span>
+        <span><i className="legend-limit" />涨停价 {formatPrice(event.limit_price)}</span>
+        <span><i className="legend-reference" />昨收 {formatPrice(event.reference_close)}</span>
+      </div>
+      <svg
+        className="stock-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={`${event.code} 当日分钟价格、成交量与成交额曲线`}
+        onPointerMove={(pointerEvent) => updateActivePoint(pointerEvent.clientX, pointerEvent.currentTarget)}
+        onPointerLeave={() => setActiveIndex(Math.max(0, points.length - 1))}
+      >
+        <title>{event.code} 当日分钟行情</title>
+        <desc>共享时间轴展示分钟最高价、最低价、收盘价、成交量和成交额，并标记涨停价与首次触板时间。</desc>
+
+        {priceTicks.map((tick) => (
+          <g key={tick}>
+            <line className="stock-grid" x1={margin.left} x2={width - margin.right} y1={yPrice(tick)} y2={yPrice(tick)} />
+            <text className="stock-axis-label" x={margin.left - 10} y={yPrice(tick) + 4} textAnchor="end">{tick.toFixed(2)}</text>
+          </g>
+        ))}
+        <text className="stock-lane-label" x={margin.left} y={priceTop - 10}>价格（元）</text>
+        <path className="stock-line stock-high" d={linePath((point) => point.high, yPrice)} />
+        <path className="stock-line stock-low" d={linePath((point) => point.low, yPrice)} />
+        <path className="stock-line stock-close" d={linePath((point) => point.close, yPrice)} />
+        <line className="stock-reference-line" x1={margin.left} x2={width - margin.right} y1={yPrice(event.reference_close)} y2={yPrice(event.reference_close)} />
+        <line className="stock-limit-line" x1={margin.left} x2={width - margin.right} y1={yPrice(event.limit_price)} y2={yPrice(event.limit_price)} />
+
+        <line className="stock-grid" x1={margin.left} x2={width - margin.right} y1={volumeTop + volumeHeight} y2={volumeTop + volumeHeight} />
+        <text className="stock-lane-label" x={margin.left} y={volumeTop - 10}>分钟成交量</text>
+        <text className="stock-axis-label" x={margin.left - 10} y={volumeTop + 4} textAnchor="end">{formatCompact(maxVolume)}</text>
+        <path className="stock-area stock-volume-area" d={areaPath((point) => point.volume, yVolume, volumeTop + volumeHeight)} />
+        <path className="stock-line stock-volume" d={linePath((point) => point.volume, yVolume)} />
+
+        <line className="stock-grid" x1={margin.left} x2={width - margin.right} y1={amountTop + amountHeight} y2={amountTop + amountHeight} />
+        <text className="stock-lane-label" x={margin.left} y={amountTop - 10}>分钟成交额（元）</text>
+        <text className="stock-axis-label" x={margin.left - 10} y={amountTop + 4} textAnchor="end">{formatCompact(maxAmount)}</text>
+        <path className="stock-area stock-amount-area" d={areaPath((point) => point.amount, yAmount, amountTop + amountHeight)} />
+        <path className="stock-line stock-amount" d={linePath((point) => point.amount, yAmount)} />
+
+        {timeTicks.map((time) => (
+          <g key={time}>
+            <line className="stock-time-grid" x1={x(time)} x2={x(time)} y1={priceTop} y2={amountTop + amountHeight} />
+            <text className="stock-axis-label stock-time-label" x={x(time)} y={height - 15} textAnchor={time === "09:30" ? "start" : time === "15:00" ? "end" : "middle"}>{time}</text>
+          </g>
+        ))}
+
+        {touchPoint && (
+          <g>
+            <line className="stock-touch-line" x1={x(touchPoint.time)} x2={x(touchPoint.time)} y1={priceTop} y2={amountTop + amountHeight} />
+            <circle className="stock-touch-point" cx={x(touchPoint.time)} cy={yPrice(event.limit_price)} r="5" />
+            <text className="stock-touch-label" x={x(touchPoint.time) + 7} y={yPrice(event.limit_price) - 9}>首次触板 {touchPoint.time}</text>
+          </g>
+        )}
+
+        {activePoint && (
+          <g className="stock-cursor">
+            <line x1={x(activePoint.time)} x2={x(activePoint.time)} y1={priceTop} y2={amountTop + amountHeight} />
+            <circle cx={x(activePoint.time)} cy={yPrice(activePoint.close)} r="4" />
+          </g>
+        )}
+      </svg>
+      {activePoint && (
+        <div className="stock-readout" aria-live="polite">
+          <strong>{activePoint.time}</strong>
+          <span>开 {formatPrice(activePoint.open)}</span>
+          <span>高 {formatPrice(activePoint.high)}</span>
+          <span>低 {formatPrice(activePoint.low)}</span>
+          <span>收 {formatPrice(activePoint.close)}</span>
+          <span>量 {formatCompact(activePoint.volume)}</span>
+          <span>额 {formatCompact(activePoint.amount)}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Dashboard() {
   const [events, setEvents] = useState<LimitEvent[]>([]);
   const [dates, setDates] = useState<string[]>([]);
@@ -200,6 +378,10 @@ export default function Dashboard() {
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [error, setError] = useState("");
+  const [selectedCode, setSelectedCode] = useState("");
+  const [minuteStocks, setMinuteStocks] = useState<Map<string, MinutePoint[]>>(new Map());
+  const [minuteLoading, setMinuteLoading] = useState(false);
+  const [minuteError, setMinuteError] = useState("");
 
   useEffect(() => {
     let active = true;
@@ -227,6 +409,36 @@ export default function Dashboard() {
     setTypeFilter("全部");
   }, [selectedDate]);
 
+  useEffect(() => {
+    const choices = events
+      .filter((event) => event.date === selectedDate)
+      .sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time));
+    setSelectedCode((current) =>
+      choices.some((event) => event.code === current) ? current : (choices[0]?.code ?? ""),
+    );
+  }, [events, selectedDate]);
+
+  useEffect(() => {
+    if (!selectedDate) return;
+    const controller = new AbortController();
+    setMinuteLoading(true);
+    setMinuteError("");
+    setMinuteStocks(new Map());
+    fetch(`/data/minutes/${selectedDate}.json`, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`分钟行情请求失败：${response.status}`);
+        return response.json() as Promise<MinutePayload>;
+      })
+      .then((payload) => setMinuteStocks(inflateMinutePayload(payload)))
+      .catch((reason: Error) => {
+        if (reason.name !== "AbortError") setMinuteError(reason.message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setMinuteLoading(false);
+      });
+    return () => controller.abort();
+  }, [selectedDate]);
+
   const dayEvents = useMemo(
     () => events.filter((event) => event.date === selectedDate),
     [events, selectedDate],
@@ -239,6 +451,12 @@ export default function Dashboard() {
     return current;
   }, null);
   const totalAmount = dayEvents.reduce((sum, event) => sum + event.total_amount, 0);
+  const stockChoices = useMemo(
+    () => [...dayEvents].sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time)),
+    [dayEvents],
+  );
+  const selectedEvent = dayEvents.find((event) => event.code === selectedCode) ?? null;
+  const selectedPoints = minuteStocks.get(selectedCode) ?? [];
 
   const filteredEvents = useMemo(() => {
     const normalizedQuery = query.trim().toUpperCase();
@@ -398,6 +616,53 @@ export default function Dashboard() {
             </div>
           </dl>
         </aside>
+      </section>
+
+      <section className="panel stock-panel" id="stock-analysis">
+        <div className="panel-heading stock-heading">
+          <div>
+            <span className="panel-kicker">STOCK INTRADAY</span>
+            <h2>个股当日曲线</h2>
+            <p>选择当天的一只触板股票，查看分钟价格、成交量和成交额的同步变化</p>
+          </div>
+          <label className="stock-selector">
+            <span>选择股票</span>
+            <select value={selectedCode} onChange={(selectEvent) => setSelectedCode(selectEvent.target.value)}>
+              {stockChoices.map((event) => (
+                <option key={event.code} value={event.code}>
+                  {event.code} · {event.classification} · {timeOnly(event.first_touch_time)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
+
+        {selectedEvent && (
+          <div className="stock-summary">
+            <div className="stock-identity">
+              <strong>{selectedEvent.code}</strong>
+              <span className={`status-badge ${selectedEvent.classification === "封板" ? "sealed" : "opened"}`}>
+                {selectedEvent.classification}
+              </span>
+              <small>{selectedEvent.board}</small>
+            </div>
+            <dl>
+              <div><dt>首次触板</dt><dd>{timeOnly(selectedEvent.first_touch_time)}</dd></div>
+              <div><dt>最后触板</dt><dd>{timeOnly(selectedEvent.last_touch_time)}</dd></div>
+              <div><dt>涨停价</dt><dd>{formatPrice(selectedEvent.limit_price)}</dd></div>
+              <div><dt>日收盘</dt><dd>{formatPrice(selectedEvent.daily_close)}</dd></div>
+            </dl>
+          </div>
+        )}
+
+        {minuteLoading && <div className="stock-data-state"><i className="loading-mark" aria-hidden="true" />正在载入分钟行情…</div>}
+        {minuteError && <div className="stock-data-state stock-data-error">{minuteError}</div>}
+        {!minuteLoading && !minuteError && selectedEvent && selectedPoints.length > 0 && (
+          <StockIntradayChart event={selectedEvent} points={selectedPoints} />
+        )}
+        {!minuteLoading && !minuteError && selectedEvent && !selectedPoints.length && (
+          <div className="stock-data-state">该股票当天没有可用的分钟行情</div>
+        )}
       </section>
 
       <section className="panel table-panel">

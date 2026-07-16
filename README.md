@@ -1,98 +1,44 @@
-# vinext-starter
+# 主板涨停观察台
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+按交易日查看沪深主板 10% 触板事件，并支持选择当天股票查看分钟价格、成交量和成交额曲线。
 
-## Prerequisites
+## 数据准备
 
-- Node.js `>=22.13.0`
+网页数据来自：
 
-## Quick Start
+- `../limit_up_output/all_limit_up_events.csv`：触板事件与封板/开板结果
+- `../2026/YYYYMMDD.parquet`：对应交易日的分钟行情
+
+运行数据转换：
+
+```bash
+C:\Anaconda3\python.exe prepare_dashboard_data.py
+```
+
+脚本会生成：
+
+- `public/data/events.json`：全部日级事件
+- `public/data/minutes/YYYYMMDD.json`：按交易日拆分的触板股票分钟行情
+
+分钟数据按日期延迟加载，切换股票时不需要重复请求同一天的数据。
+
+## 本地运行
 
 ```bash
 npm install
 npm run dev
+```
+
+构建检查：
+
+```bash
 npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+## 个股图表口径
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+- 价格区：分钟最高价、最低价和收盘价，并显示昨收价与理论涨停价
+- 成交量区：每分钟 `vol`
+- 成交额区：每分钟 `amount`
+- 首次触板标记：分钟最高价第一次等于理论涨停价的时刻
+- 午间休市：11:30 和 13:00 在横轴上相邻显示
