@@ -7,7 +7,7 @@
 网页数据来自：
 
 - `../limit_up_output/all_limit_up_events.csv`：触板事件与封板/开板结果
-- `../2026/YYYYMMDD.parquet`：对应交易日的分钟行情
+- `../2025/YYYYMMDD.parquet`、`../2026/YYYYMMDD.parquet`：对应交易日的分钟行情；脚本会根据日期年份自动定位目录
 
 运行数据转换：
 

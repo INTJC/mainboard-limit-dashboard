@@ -15,7 +15,7 @@ import pyarrow.parquet as pq
 ROOT = Path(__file__).resolve().parent
 SOURCE = ROOT.parent / "limit_up_output" / "all_limit_up_events.csv"
 OUTPUT = ROOT / "public" / "data" / "events.json"
-MINUTE_SOURCE = ROOT.parent / "2026"
+DATA_ROOT = ROOT.parent
 MINUTE_OUTPUT = ROOT / "public" / "data" / "minutes"
 
 TEXT_FIELDS = [
@@ -78,7 +78,7 @@ def write_minute_payloads(event_codes: dict[str, set[str]]) -> None:
     total_points = 0
 
     for date, codes in sorted(event_codes.items()):
-        source_path = MINUTE_SOURCE / f"{date}.parquet"
+        source_path = DATA_ROOT / date[:4] / f"{date}.parquet"
         if not source_path.exists():
             raise FileNotFoundError(f"找不到 {date} 的分钟行情：{source_path}")
 
@@ -126,6 +126,11 @@ def write_minute_payloads(event_codes: dict[str, set[str]]) -> None:
             encoding="utf-8",
         )
         total_stocks += len(stocks)
+
+    expected_files = {f"{date}.json" for date in event_codes}
+    for stale_path in MINUTE_OUTPUT.glob("*.json"):
+        if stale_path.name not in expected_files:
+            stale_path.unlink()
 
     print(
         f"已生成 {len(event_codes)} 个分钟行情分片："
