@@ -167,6 +167,60 @@ button:disabled {
   font-weight: 700;
 }
 
+.board-filter {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(116px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.board-filter button {
+  display: flex;
+  min-width: 116px;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease, color 150ms ease;
+}
+
+.board-filter button:hover {
+  color: var(--sealed);
+  border-color: rgba(47, 110, 163, 0.45);
+}
+
+.board-filter button.active {
+  color: var(--accent);
+  background: var(--surface);
+  border-color: var(--sealed);
+  box-shadow: 0 5px 18px rgba(26, 43, 65, 0.06);
+}
+
+.board-filter button span {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.board-filter button strong {
+  min-width: 24px;
+  padding: 3px 6px;
+  color: inherit;
+  background: var(--paper);
+  border-radius: 999px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  text-align: center;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -769,6 +823,7 @@ td small {
 }
 
 @media (max-width: 940px) {
+  .board-filter { grid-template-columns: repeat(3, minmax(116px, 1fr)); }
   .metric-grid { grid-template-columns: repeat(2, 1fr); }
   .analysis-grid { grid-template-columns: 1fr; }
   .day-facts dl { grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -784,6 +839,9 @@ td small {
   .date-control { width: 100%; }
   .date-control label { flex: 1; }
   .date-control input { width: 100%; }
+  .day-heading { align-items: flex-start; gap: 12px; }
+  .scope-chip { max-width: 58%; text-align: right; }
+  .board-filter { display: flex; padding-bottom: 4px; }
   .chart-panel, .day-facts { padding: 17px; }
   .stock-panel { padding: 17px; }
   .panel-heading, .table-heading { flex-direction: column; }

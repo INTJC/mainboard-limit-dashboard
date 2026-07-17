@@ -1,48 +1,50 @@
-# 主板涨停观察台
+# 全市场涨停观察台
 
-按交易日查看沪深主板 10% 触板事件，并支持选择当天股票查看分钟价格、成交量和成交额曲线。
+按交易日查看 2023—2026 年沪市主板、深市主板、创业板、科创板和北交所触板事件。页面支持板块筛选，并可选择当日股票查看分钟价格、成交量和成交额曲线。
 
 ## 数据准备
 
 网页数据来自：
 
-- `../limit_up_output/all_limit_up_events.csv`：触板事件与封板/开板结果
-- `../2025/YYYYMMDD.parquet`、`../2026/YYYYMMDD.parquet`：对应交易日的分钟行情；脚本会根据日期年份自动定位目录
+- `../limit_up_output/all_limit_up_events.csv`：全板块触板事件及封板/开板结果；
+- `../2023/YYYYMMDD.parquet` 至 `../2026/YYYYMMDD.parquet`：对应交易日的分钟行情。
 
 运行数据转换：
 
-```bash
+```powershell
 C:\Anaconda3\python.exe prepare_dashboard_data.py
 ```
 
 脚本会生成：
 
-- `public/data/events.json`：全部日级事件
-- `public/data/minutes/YYYYMMDD.json`：按交易日拆分的触板股票分钟行情
+- `public/data/events.json`：全部日期、板块和事件；
+- `public/data/minutes/YYYYMMDD.bin`：按交易日拆分的紧凑分钟行情。
 
-分钟数据按日期延迟加载，切换股票时不需要重复请求同一天的数据。
+页面首先载入事件索引；分钟行情采用差分和变长整数编码，只在选择日期后加载，切换同一天的股票不会重复请求数据。价格保留到分，图表用分钟成交量按百股、成交额按千元存储并在前端恢复单位。
 
 ## 本地运行
 
-```bash
+```powershell
 npm install
 npm run dev
 ```
 
 构建检查：
 
-```bash
+```powershell
 npm run build
 ```
 
 ## GitHub Pages
 
-仓库包含 `.github/workflows/deploy-pages.yml`。推送到默认分支后，GitHub Actions 会自动执行静态导出并部署 Pages。项目仓库和 `<用户名>.github.io` 仓库都会自动使用正确的访问路径。
+仓库包含 `.github/workflows/deploy-pages.yml`。推送到默认分支后，GitHub Actions 会自动执行静态导出并部署 Pages。
 
-## 个股图表口径
+## 页面筛选口径
 
-- 价格区：分钟最高价、最低价和收盘价，并显示昨收价与理论涨停价
-- 成交量区：每分钟 `vol`
-- 成交额区：每分钟 `amount`
-- 首次触板标记：分钟最高价第一次等于理论涨停价的时刻
-- 午间休市：11:30 和 13:00 在横轴上相邻显示
+- 全部板块：显示当天所有正式触板事件；
+- 沪市主板、深市主板：正常涨停幅度 10%；
+- 创业板、科创板：正常涨停幅度 20%；
+- 北交所：正常涨停幅度 30%；
+- 选择板块后，关键指标、累计曲线、个股列表和触板明细会同步更新。
+
+未核验的 5% ST 候选不包含在网页正式结果中。

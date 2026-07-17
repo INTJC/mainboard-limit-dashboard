@@ -20,7 +20,7 @@ test("server-renders the dashboard loading state and metadata", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>主板涨停观察台<\/title>/);
+  assert.match(html, /<title>全市场涨停观察台<\/title>/);
   assert.match(html, /正在整理触板数据/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
@@ -31,6 +31,7 @@ test("event index and daily minute payload use matching stock codes", async () =
   );
   assert.ok(eventsPayload.event_count > 0);
   assert.ok(eventsPayload.dates.length > 0);
+  assert.deepEqual(eventsPayload.boards, ["沪市主板", "深市主板", "创业板", "科创板", "北交所"]);
 
   const firstDate = eventsPayload.dates[0];
   const dateIndex = eventsPayload.fields.indexOf("date");
@@ -40,12 +41,35 @@ test("event index and daily minute payload use matching stock codes", async () =
       .filter((event) => event[dateIndex] === firstDate)
       .map((event) => event[codeIndex]),
   );
-  const minutePayload = JSON.parse(
-    await readFile(new URL(`../public/data/minutes/${firstDate}.json`, import.meta.url), "utf8"),
+  const minuteBytes = await readFile(
+    new URL(`../public/data/minutes/${firstDate}.bin`, import.meta.url),
   );
-  const actualCodes = new Set(minutePayload.stocks.map((stock) => stock[0]));
+  assert.equal(minuteBytes.subarray(0, 4).toString("ascii"), "LUP2");
+  let offset = 4;
+  const readUnsigned = () => {
+    let value = 0;
+    let multiplier = 1;
+    while (offset < minuteBytes.length) {
+      const byte = minuteBytes[offset++];
+      value += (byte & 0x7f) * multiplier;
+      if ((byte & 0x80) === 0) return value;
+      multiplier *= 128;
+    }
+    throw new Error("Incomplete minute payload");
+  };
+  const actualCodes = new Set();
+  const stockCount = readUnsigned();
+  for (let stockIndex = 0; stockIndex < stockCount; stockIndex += 1) {
+    const codeLength = minuteBytes[offset++];
+    const code = minuteBytes.subarray(offset, offset + codeLength).toString("ascii");
+    offset += codeLength;
+    actualCodes.add(code);
+    const pointCount = readUnsigned();
+    assert.ok(pointCount > 0);
+    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+      for (let fieldIndex = 0; fieldIndex < 7; fieldIndex += 1) readUnsigned();
+    }
+  }
 
-  assert.equal(minutePayload.date, firstDate);
   assert.deepEqual(actualCodes, expectedCodes);
-  assert.ok(minutePayload.stocks.every((stock) => stock[1].length > 0));
 });

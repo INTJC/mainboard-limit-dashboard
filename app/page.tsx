@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 type Classification = "封板" | "开板";
+type BoardFilter = "全部板块" | string;
 
 type LimitEvent = {
   date: string;
@@ -29,6 +30,7 @@ type LimitEvent = {
 type CompactPayload = {
   event_count: number;
   dates: string[];
+  boards: string[];
   fields: (keyof LimitEvent)[];
   events: Array<Array<string | number | null>>;
 };
@@ -43,17 +45,17 @@ type MinutePoint = {
   amount: number;
 };
 
-type MinutePayload = {
-  date: string;
-  point_fields: string[];
-  stock_count: number;
-  stocks: Array<[string, Array<Array<string | number | null>>]>;
-};
-
 const PAGE_SIZE = 18;
 const DATA_BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const SEALED = "#2f6ea3";
 const OPENED = "#e0785c";
+const BOARD_LIMIT_RATE: Record<string, string> = {
+  沪市主板: "10%",
+  深市主板: "10%",
+  创业板: "20%",
+  科创板: "20%",
+  北交所: "30%",
+};
 
 function inflatePayload(payload: CompactPayload): LimitEvent[] {
   return payload.events.map((values) => {
@@ -64,21 +66,63 @@ function inflatePayload(payload: CompactPayload): LimitEvent[] {
   });
 }
 
-function inflateMinutePayload(payload: MinutePayload) {
-  return new Map<string, MinutePoint[]>(
-    payload.stocks.map(([code, rows]) => [
-      code,
-      rows.map((row) => ({
-        time: String(row[0] ?? ""),
-        open: Number(row[1]),
-        high: Number(row[2]),
-        low: Number(row[3]),
-        close: Number(row[4]),
-        volume: Number(row[5]),
-        amount: Number(row[6]),
-      })),
-    ]),
-  );
+function inflateMinutePayload(buffer: ArrayBuffer) {
+  const bytes = new Uint8Array(buffer);
+  const decoder = new TextDecoder();
+  let offset = 0;
+
+  const readByte = () => bytes[offset++];
+  const readUnsigned = () => {
+    let value = 0;
+    let multiplier = 1;
+    while (offset < bytes.length) {
+      const byte = readByte();
+      value += (byte & 0x7f) * multiplier;
+      if ((byte & 0x80) === 0) return value;
+      multiplier *= 128;
+    }
+    throw new Error("分钟行情文件不完整");
+  };
+  const readSigned = () => {
+    const value = readUnsigned();
+    return value % 2 === 0 ? value / 2 : -((value + 1) / 2);
+  };
+  const magic = decoder.decode(bytes.subarray(0, 4));
+  if (magic !== "LUP2") throw new Error("分钟行情文件格式不受支持");
+  offset = 4;
+
+  const stocks = new Map<string, MinutePoint[]>();
+  const stockCount = readUnsigned();
+  for (let stockIndex = 0; stockIndex < stockCount; stockIndex += 1) {
+    const codeLength = readByte();
+    const code = decoder.decode(bytes.subarray(offset, offset + codeLength));
+    offset += codeLength;
+    const pointCount = readUnsigned();
+    const points: MinutePoint[] = [];
+    let absoluteMinute = 0;
+    let previousClose = 0;
+    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
+      absoluteMinute += readUnsigned();
+      const open = previousClose + readSigned();
+      const high = open + readSigned();
+      const low = open + readSigned();
+      const close = open + readSigned();
+      const volume = readUnsigned() * 100;
+      const amount = readUnsigned() * 1000;
+      points.push({
+        time: `${String(Math.floor(absoluteMinute / 60)).padStart(2, "0")}:${String(absoluteMinute % 60).padStart(2, "0")}`,
+        open: open / 100,
+        high: high / 100,
+        low: low / 100,
+        close: close / 100,
+        volume,
+        amount,
+      });
+      previousClose = close;
+    }
+    stocks.set(code, points);
+  }
+  return stocks;
 }
 
 function dateInputValue(date: string) {
@@ -148,7 +192,7 @@ function buildCumulative(events: LimitEvent[], type: Classification) {
   });
 }
 
-function CumulativeChart({ events }: { events: LimitEvent[] }) {
+function CumulativeChart({ events, scope }: { events: LimitEvent[]; scope: string }) {
   const sealed = useMemo(() => buildCumulative(events, "封板"), [events]);
   const opened = useMemo(() => buildCumulative(events, "开板"), [events]);
   const maxValue = Math.max(1, sealed.at(-1) ?? 0, opened.at(-1) ?? 0);
@@ -193,10 +237,10 @@ function CumulativeChart({ events }: { events: LimitEvent[] }) {
         className="curve-chart"
         viewBox={`0 0 ${width} ${height}`}
         role="img"
-        aria-label="当日封板与开板股票按真实首次触板时间计算的累计曲线"
+        aria-label={`${scope}当日封板与开板股票按真实首次触板时间计算的累计曲线`}
       >
-        <title>当日累计触板曲线</title>
-        <desc>横轴是实际交易时刻，纵轴是累计触板股票数量。</desc>
+        <title>{scope}当日累计触板曲线</title>
+        <desc>横轴是实际交易时刻，纵轴是筛选范围内的累计触板股票数量。</desc>
         {yTicks.map((tick) => (
           <g key={tick}>
             <line
@@ -374,7 +418,9 @@ function StockIntradayChart({ event, points }: { event: LimitEvent; points: Minu
 export default function Dashboard() {
   const [events, setEvents] = useState<LimitEvent[]>([]);
   const [dates, setDates] = useState<string[]>([]);
+  const [boards, setBoards] = useState<string[]>([]);
   const [selectedDate, setSelectedDate] = useState("");
+  const [boardFilter, setBoardFilter] = useState<BoardFilter>("全部板块");
   const [typeFilter, setTypeFilter] = useState<"全部" | Classification>("全部");
   const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
@@ -396,6 +442,7 @@ export default function Dashboard() {
         const inflated = inflatePayload(payload);
         setEvents(inflated);
         setDates(payload.dates);
+        setBoards(payload.boards ?? [...new Set(inflated.map((event) => event.board))]);
         setSelectedDate(payload.dates.at(-1) ?? "");
       })
       .catch((reason: Error) => active && setError(reason.message));
@@ -412,12 +459,16 @@ export default function Dashboard() {
 
   useEffect(() => {
     const choices = events
-      .filter((event) => event.date === selectedDate)
+      .filter(
+        (event) =>
+          event.date === selectedDate &&
+          (boardFilter === "全部板块" || event.board === boardFilter),
+      )
       .sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time));
     setSelectedCode((current) =>
       choices.some((event) => event.code === current) ? current : (choices[0]?.code ?? ""),
     );
-  }, [events, selectedDate]);
+  }, [events, selectedDate, boardFilter]);
 
   useEffect(() => {
     if (!selectedDate) return;
@@ -425,10 +476,10 @@ export default function Dashboard() {
     setMinuteLoading(true);
     setMinuteError("");
     setMinuteStocks(new Map());
-    fetch(`${DATA_BASE}/data/minutes/${selectedDate}.json`, { signal: controller.signal })
+    fetch(`${DATA_BASE}/data/minutes/${selectedDate}.bin`, { signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`分钟行情请求失败：${response.status}`);
-        return response.json() as Promise<MinutePayload>;
+        return response.arrayBuffer();
       })
       .then((payload) => setMinuteStocks(inflateMinutePayload(payload)))
       .catch((reason: Error) => {
@@ -444,28 +495,45 @@ export default function Dashboard() {
     () => events.filter((event) => event.date === selectedDate),
     [events, selectedDate],
   );
-  const sealedCount = dayEvents.filter((event) => event.classification === "封板").length;
-  const openedCount = dayEvents.length - sealedCount;
-  const sealRate = dayEvents.length ? sealedCount / dayEvents.length : 0;
-  const earliest = dayEvents.reduce<LimitEvent | null>((current, event) => {
+  const scopedEvents = useMemo(
+    () =>
+      dayEvents.filter(
+        (event) => boardFilter === "全部板块" || event.board === boardFilter,
+      ),
+    [boardFilter, dayEvents],
+  );
+  const boardCounts = useMemo(
+    () =>
+      Object.fromEntries(
+        boards.map((board) => [
+          board,
+          dayEvents.filter((event) => event.board === board).length,
+        ]),
+      ),
+    [boards, dayEvents],
+  );
+  const sealedCount = scopedEvents.filter((event) => event.classification === "封板").length;
+  const openedCount = scopedEvents.length - sealedCount;
+  const sealRate = scopedEvents.length ? sealedCount / scopedEvents.length : 0;
+  const earliest = scopedEvents.reduce<LimitEvent | null>((current, event) => {
     if (!current || event.first_touch_time < current.first_touch_time) return event;
     return current;
   }, null);
-  const totalAmount = dayEvents.reduce((sum, event) => sum + event.total_amount, 0);
+  const totalAmount = scopedEvents.reduce((sum, event) => sum + event.total_amount, 0);
   const stockChoices = useMemo(
-    () => [...dayEvents].sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time)),
-    [dayEvents],
+    () => [...scopedEvents].sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time)),
+    [scopedEvents],
   );
-  const selectedEvent = dayEvents.find((event) => event.code === selectedCode) ?? null;
+  const selectedEvent = scopedEvents.find((event) => event.code === selectedCode) ?? null;
   const selectedPoints = minuteStocks.get(selectedCode) ?? [];
 
   const filteredEvents = useMemo(() => {
     const normalizedQuery = query.trim().toUpperCase();
-    return dayEvents
+    return scopedEvents
       .filter((event) => typeFilter === "全部" || event.classification === typeFilter)
       .filter((event) => !normalizedQuery || event.code.includes(normalizedQuery))
       .sort((a, b) => a.first_touch_time.localeCompare(b.first_touch_time));
-  }, [dayEvents, query, typeFilter]);
+  }, [query, scopedEvents, typeFilter]);
   const totalPages = Math.max(1, Math.ceil(filteredEvents.length / PAGE_SIZE));
   const visibleEvents = filteredEvents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   const dateIndex = dates.indexOf(selectedDate);
@@ -505,9 +573,9 @@ export default function Dashboard() {
     <main className="dashboard-shell">
       <header className="topbar">
         <div>
-          <span className="eyebrow">MAIN BOARD · 10% LIMIT</span>
-          <h1>主板涨停观察台</h1>
-          <p className="subtitle">查看每个交易日的真实触板节奏、封板结果与事件明细</p>
+          <span className="eyebrow">A-SHARE LIMIT EVENTS · 2023—2026</span>
+          <h1>全市场涨停观察台</h1>
+          <p className="subtitle">按日期与板块查看真实触板节奏、封板结果和个股分钟行情</p>
         </div>
         <div className="date-control" aria-label="选择交易日期">
           <button
@@ -546,13 +614,38 @@ export default function Dashboard() {
           <p className="day-date">{displayDate(selectedDate)}</p>
           <p className="day-context">第 {dateIndex + 1} / {dates.length} 个交易日</p>
         </div>
-        <span className="scope-chip">沪深主板 · 10%</span>
+        <span className="scope-chip">
+          {boardFilter === "全部板块"
+            ? "全部板块 · 10% / 20% / 30%"
+            : `${boardFilter} · ${BOARD_LIMIT_RATE[boardFilter] ?? "对应涨停规则"}`}
+        </span>
       </section>
+
+      <nav className="board-filter" aria-label="按股票板块筛选">
+        {["全部板块", ...boards].map((board) => {
+          const count = board === "全部板块" ? dayEvents.length : (boardCounts[board] ?? 0);
+          return (
+            <button
+              key={board}
+              type="button"
+              className={boardFilter === board ? "active" : ""}
+              aria-pressed={boardFilter === board}
+              onClick={() => {
+                setBoardFilter(board);
+                setPage(1);
+              }}
+            >
+              <span>{board}</span>
+              <strong>{count}</strong>
+            </button>
+          );
+        })}
+      </nav>
 
       <section className="metric-grid" aria-label="当日关键指标">
         <article className="metric-card metric-total">
           <span>触板合计</span>
-          <strong>{dayEvents.length}</strong>
+          <strong>{scopedEvents.length}</strong>
           <small>只 / 次</small>
         </article>
         <article className="metric-card metric-sealed">
@@ -568,7 +661,7 @@ export default function Dashboard() {
         <article className="metric-card metric-rate">
           <span>封板率</span>
           <strong>{formatPercent(sealRate)}</strong>
-          <small>{sealedCount} / {dayEvents.length}</small>
+          <small>{sealedCount} / {scopedEvents.length}</small>
         </article>
       </section>
 
@@ -577,15 +670,15 @@ export default function Dashboard() {
           <div className="panel-heading">
             <div>
               <span className="panel-kicker">INTRADAY CURVE</span>
-              <h2>累计触板曲线</h2>
-              <p>按真实首次触板分钟累计，午间休市区间压缩显示</p>
+              <h2>{boardFilter === "全部板块" ? "全市场累计触板曲线" : `${boardFilter}累计触板曲线`}</h2>
+              <p>当前板块筛选会同步作用于曲线、指标、个股和明细</p>
             </div>
             <div className="chart-legend" aria-label="图例">
               <span><i style={{ background: SEALED }} />封板 {sealedCount}</span>
               <span><i style={{ background: OPENED }} />开板 {openedCount}</span>
             </div>
           </div>
-          <CumulativeChart events={dayEvents} />
+          <CumulativeChart events={scopedEvents} scope={boardFilter} />
         </article>
 
         <aside className="panel day-facts">
@@ -609,8 +702,8 @@ export default function Dashboard() {
             <div>
               <dt>平均触板分钟数</dt>
               <dd>
-                {dayEvents.length
-                  ? (dayEvents.reduce((sum, event) => sum + event.touch_minutes, 0) / dayEvents.length).toFixed(1)
+                {scopedEvents.length
+                  ? (scopedEvents.reduce((sum, event) => sum + event.touch_minutes, 0) / scopedEvents.length).toFixed(1)
                   : "—"}
               </dd>
               <small>最高价等于涨停价</small>
@@ -761,7 +854,7 @@ export default function Dashboard() {
 
       <footer className="site-footer">
         <span>数据范围：{dateInputValue(dates[0])} — {dateInputValue(dates.at(-1) ?? dates[0])}</span>
-        <span>口径：当日最高价精确等于主板 10% 涨停价</span>
+        <span>口径：主板 10% · 创业板/科创板 20% · 北交所 30%</span>
       </footer>
     </main>
   );
