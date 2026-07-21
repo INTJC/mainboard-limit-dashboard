@@ -295,26 +295,34 @@ def main() -> None:
     boards.extend(sorted(observed_boards - set(boards)))
     args.event_shard_output.mkdir(parents=True, exist_ok=True)
     date_index = fields.index("date")
-    half_month_events: dict[str, list[list[Any]]] = defaultdict(list)
+    monthly_events: dict[str, list[list[Any]]] = defaultdict(list)
     for event in events:
         date = str(event[date_index])
-        half = "1" if int(date[6:8]) <= 15 else "2"
-        half_month_events[f"{date[:6]}-{half}"].append(event)
+        monthly_events[date[:6]].append(event)
     shards = []
     expected_shard_files = set()
-    for period, period_events in sorted(half_month_events.items()):
-        filename = f"{period}.json"
-        expected_shard_files.add(filename)
-        (args.event_shard_output / filename).write_text(
-            json.dumps(period_events, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        shards.append(
-            {
-                "path": f"data/events/{filename}",
-                "event_count": len(period_events),
-            }
-        )
+    for month, month_events in sorted(monthly_events.items()):
+        encoded = json.dumps(
+            month_events, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        parts = [(month, month_events)]
+        if len(encoded) > 800_000:
+            first = [event for event in month_events if int(str(event[date_index])[6:8]) <= 15]
+            second = [event for event in month_events if int(str(event[date_index])[6:8]) > 15]
+            parts = [(f"{month}-1", first), (f"{month}-2", second)]
+        for period, period_events in parts:
+            filename = f"{period}.json"
+            expected_shard_files.add(filename)
+            (args.event_shard_output / filename).write_text(
+                json.dumps(period_events, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            shards.append(
+                {
+                    "path": f"data/events/{filename}",
+                    "event_count": len(period_events),
+                }
+            )
     for stale_path in args.event_shard_output.glob("*.json"):
         if stale_path.name not in expected_shard_files:
             stale_path.unlink()
