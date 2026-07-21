@@ -32,7 +32,9 @@ type CompactPayload = {
   dates: string[];
   boards: string[];
   fields: (keyof LimitEvent)[];
-  events: Array<Array<string | number | null>>;
+  events?: Array<Array<string | number | null>>;
+  shards?: Array<{ path: string; event_count: number }>;
+  base64_minute_dates?: string[];
 };
 
 type MinutePoint = {
@@ -58,7 +60,7 @@ const BOARD_LIMIT_RATE: Record<string, string> = {
 };
 
 function inflatePayload(payload: CompactPayload): LimitEvent[] {
-  return payload.events.map((values) => {
+  return (payload.events ?? []).map((values) => {
     const record = Object.fromEntries(
       payload.fields.map((field, index) => [field, values[index]]),
     );
@@ -123,6 +125,15 @@ function inflateMinutePayload(buffer: ArrayBuffer) {
     stocks.set(code, points);
   }
   return stocks;
+}
+
+function decodeBase64Buffer(encoded: string) {
+  const binary = atob(encoded.trim());
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return bytes.buffer;
 }
 
 function dateInputValue(date: string) {
@@ -427,6 +438,7 @@ export default function Dashboard() {
   const [error, setError] = useState("");
   const [selectedCode, setSelectedCode] = useState("");
   const [minuteStocks, setMinuteStocks] = useState<Map<string, MinutePoint[]>>(new Map());
+  const [base64MinuteDates, setBase64MinuteDates] = useState<Set<string>>(new Set());
   const [minuteLoading, setMinuteLoading] = useState(false);
   const [minuteError, setMinuteError] = useState("");
 
@@ -437,12 +449,27 @@ export default function Dashboard() {
         if (!response.ok) throw new Error(`数据请求失败：${response.status}`);
         return response.json() as Promise<CompactPayload>;
       })
+      .then(async (payload) => {
+        if (payload.shards?.length) {
+          const batches = await Promise.all(
+            payload.shards.map((shard) =>
+              fetch(`${DATA_BASE}/${shard.path}`).then((response) => {
+                if (!response.ok) throw new Error(`事件分片请求失败：${response.status}`);
+                return response.json() as Promise<Array<Array<string | number | null>>>;
+              }),
+            ),
+          );
+          payload.events = batches.flat();
+        }
+        return payload;
+      })
       .then((payload) => {
         if (!active) return;
         const inflated = inflatePayload(payload);
         setEvents(inflated);
         setDates(payload.dates);
         setBoards(payload.boards ?? [...new Set(inflated.map((event) => event.board))]);
+        setBase64MinuteDates(new Set(payload.base64_minute_dates ?? []));
         setSelectedDate(payload.dates.at(-1) ?? "");
       })
       .catch((reason: Error) => active && setError(reason.message));
@@ -476,10 +503,16 @@ export default function Dashboard() {
     setMinuteLoading(true);
     setMinuteError("");
     setMinuteStocks(new Map());
-    fetch(`${DATA_BASE}/data/minutes/${selectedDate}.bin`, { signal: controller.signal })
+    const usesBase64 = base64MinuteDates.has(selectedDate);
+    const minutePath = usesBase64
+      ? `${DATA_BASE}/data/minutes-base64/${selectedDate}.txt`
+      : `${DATA_BASE}/data/minutes/${selectedDate}.bin`;
+    fetch(minutePath, { signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`分钟行情请求失败：${response.status}`);
-        return response.arrayBuffer();
+        return usesBase64
+          ? response.text().then(decodeBase64Buffer)
+          : response.arrayBuffer();
       })
       .then((payload) => setMinuteStocks(inflateMinutePayload(payload)))
       .catch((reason: Error) => {
@@ -489,7 +522,7 @@ export default function Dashboard() {
         if (!controller.signal.aborted) setMinuteLoading(false);
       });
     return () => controller.abort();
-  }, [selectedDate]);
+  }, [base64MinuteDates, selectedDate]);
 
   const dayEvents = useMemo(
     () => events.filter((event) => event.date === selectedDate),
