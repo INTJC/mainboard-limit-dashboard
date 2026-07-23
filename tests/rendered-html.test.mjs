@@ -25,51 +25,59 @@ test("server-renders the dashboard loading state and metadata", async () => {
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
-test("event index and daily minute payload use matching stock codes", async () => {
-  const eventsPayload = JSON.parse(
+test("range observation controls and the shared market-data source are wired", async () => {
+  const pageSource = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(pageSource, /https:\/\/intjc\.github\.io\/mainboard-limit-dashboard/);
+  assert.match(pageSource, /payload\.shards\?\.length/);
+  assert.match(pageSource, /payload\.events = batches\.flat\(\)/);
+  assert.match(pageSource, /minutes-base64/);
+  assert.match(pageSource, /decodeBase64Buffer/);
+  assert.match(pageSource, /function buildRangeObservation/);
+  assert.match(pageSource, /区间涨停节奏观察/);
+  assert.match(pageSource, /分钟移动平均窗口/);
+  assert.match(pageSource, /板块（可多选）/);
+  assert.match(pageSource, /RangeObservationChart mode="count"/);
+  assert.match(pageSource, /RangeObservationChart mode="rate"/);
+  assert.match(pageSource, /PathStackedChart kind="sealed"/);
+  assert.match(pageSource, /PathStackedChart kind="opened"/);
+  assert.match(pageSource, /未开板封住/);
+  assert.match(pageSource, /开板后回封/);
+  assert.match(pageSource, /封板后开板/);
+  assert.match(pageSource, /触板未封/);
+  assert.match(pageSource, /所选区间路径统计/);
+  assert.match(pageSource, /不做日内累计/);
+  const rangeBuilder = pageSource.slice(
+    pageSource.indexOf("function buildRangeObservation"),
+    pageSource.indexOf("function CumulativeChart"),
+  );
+  assert.match(rangeBuilder, /sealedSums\[index\] \+= 1/);
+  assert.match(rangeBuilder, /openedSums\[index\] \+= 1/);
+  assert.match(rangeBuilder, /sealedPerMinute/);
+  assert.doesNotMatch(rangeBuilder, /buildCumulative/);
+  assert.match(rangeBuilder, /sealedShare\(value, opened\[index\]\)/);
+  assert.match(rangeBuilder, /1 - rate/);
+  assert.match(pageSource, /total <= Number\.EPSILON/);
+  assert.match(pageSource, /Math\.min\(1, Math\.max\(0, sealed \/ total\)\)/);
+});
+
+test("compact path codes preserve the sample and split every event into one valid path", async () => {
+  const manifest = JSON.parse(
     await readFile(new URL("../public/data/events.json", import.meta.url), "utf8"),
   );
-  assert.ok(eventsPayload.event_count > 0);
-  assert.ok(eventsPayload.dates.length > 0);
-  assert.deepEqual(eventsPayload.boards, ["沪市主板", "深市主板", "创业板", "科创板", "北交所"]);
-
-  const firstDate = eventsPayload.dates[0];
-  const dateIndex = eventsPayload.fields.indexOf("date");
-  const codeIndex = eventsPayload.fields.indexOf("code");
-  const expectedCodes = new Set(
-    eventsPayload.events
-      .filter((event) => event[dateIndex] === firstDate)
-      .map((event) => event[codeIndex]),
-  );
-  const minuteBytes = await readFile(
-    new URL(`../public/data/minutes/${firstDate}.bin`, import.meta.url),
-  );
-  assert.equal(minuteBytes.subarray(0, 4).toString("ascii"), "LUP2");
-  let offset = 4;
-  const readUnsigned = () => {
-    let value = 0;
-    let multiplier = 1;
-    while (offset < minuteBytes.length) {
-      const byte = minuteBytes[offset++];
-      value += (byte & 0x7f) * multiplier;
-      if ((byte & 0x80) === 0) return value;
-      multiplier *= 128;
-    }
-    throw new Error("Incomplete minute payload");
-  };
-  const actualCodes = new Set();
-  const stockCount = readUnsigned();
-  for (let stockIndex = 0; stockIndex < stockCount; stockIndex += 1) {
-    const codeLength = minuteBytes[offset++];
-    const code = minuteBytes.subarray(offset, offset + codeLength).toString("ascii");
-    offset += codeLength;
-    actualCodes.add(code);
-    const pointCount = readUnsigned();
-    assert.ok(pointCount > 0);
-    for (let pointIndex = 0; pointIndex < pointCount; pointIndex += 1) {
-      for (let fieldIndex = 0; fieldIndex < 7; fieldIndex += 1) readUnsigned();
-    }
+  assert.equal(manifest.event_count, 69_220);
+  assert.equal(manifest.dates.length, 790);
+  assert.deepEqual(manifest.path_labels, [
+    "未开板封住",
+    "开板后回封",
+    "封板后开板",
+    "触板未封",
+  ]);
+  const packed = Buffer.from(manifest.path_codes, "base64");
+  assert.equal(packed.length, Math.ceil(manifest.event_count / 4));
+  const counts = [0, 0, 0, 0];
+  for (let index = 0; index < manifest.event_count; index += 1) {
+    counts[(packed[index >> 2] >> ((index & 3) * 2)) & 3] += 1;
   }
-
-  assert.deepEqual(actualCodes, expectedCodes);
+  assert.deepEqual(counts, [25_443, 21_046, 17_022, 5_709]);
+  assert.equal(manifest.shards.reduce((sum, shard) => sum + shard.event_count, 0), 69_220);
 });
