@@ -1,8 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useState } from "react";
 
 type Classification = "封板" | "开板";
+type PathClassification =
+  | "未开板封住"
+  | "开板后回封"
+  | "封板后开板"
+  | "触板未封";
 type BoardFilter = "全部板块" | string;
 
 type LimitEvent = {
@@ -10,6 +15,7 @@ type LimitEvent = {
   code: string;
   board: string;
   classification: Classification;
+  path_classification: PathClassification;
   first_touch_time: string;
   last_touch_time: string;
   first_close_at_limit_time: string;
@@ -35,6 +41,8 @@ type CompactPayload = {
   events?: Array<Array<string | number | null>>;
   shards?: Array<{ path: string; event_count: number }>;
   base64_minute_dates?: string[];
+  path_labels?: PathClassification[];
+  path_codes?: string;
 };
 
 type MinutePoint = {
@@ -48,9 +56,16 @@ type MinutePoint = {
 };
 
 const PAGE_SIZE = 18;
-const DATA_BASE = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+const DATA_BASE =
+  process.env.NEXT_PUBLIC_DATA_BASE ??
+  "https://intjc.github.io/mainboard-limit-dashboard";
 const SEALED = "#2f6ea3";
 const OPENED = "#e0785c";
+const NEVER_OPENED = "#2f6ea3";
+const RESEALED = "#83b5d5";
+const SEALED_THEN_OPENED = "#d7684b";
+const TOUCHED_NOT_SEALED = "#efb3a3";
+const TRADING_MINUTES = 242;
 const BOARD_LIMIT_RATE: Record<string, string> = {
   沪市主板: "10%",
   深市主板: "10%",
@@ -60,11 +75,28 @@ const BOARD_LIMIT_RATE: Record<string, string> = {
 };
 
 function inflatePayload(payload: CompactPayload): LimitEvent[] {
-  return (payload.events ?? []).map((values) => {
+  const pathBytes = payload.path_codes
+    ? Uint8Array.from(atob(payload.path_codes), (character) => character.charCodeAt(0))
+    : new Uint8Array();
+  const pathLabels = payload.path_labels ?? [];
+  return (payload.events ?? []).map((values, eventIndex) => {
     const record = Object.fromEntries(
       payload.fields.map((field, index) => [field, values[index]]),
-    );
-    return record as LimitEvent;
+    ) as LimitEvent;
+    if (!record.path_classification) {
+      const packedCode =
+        pathBytes.length > (eventIndex >> 2)
+          ? (pathBytes[eventIndex >> 2] >> ((eventIndex & 3) * 2)) & 3
+          : -1;
+      record.path_classification =
+        pathLabels[packedCode] ??
+        (record.classification === "封板"
+          ? "未开板封住"
+          : record.first_close_at_limit_time
+            ? "封板后开板"
+            : "触板未封");
+    }
+    return record;
   });
 }
 
@@ -130,7 +162,9 @@ function inflateMinutePayload(buffer: ArrayBuffer) {
 function decodeBase64Buffer(encoded: string) {
   const binary = atob(encoded.trim());
   const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
   return bytes.buffer;
 }
 
@@ -188,7 +222,7 @@ function minuteTimeIndex(time: string) {
 }
 
 function buildCumulative(events: LimitEvent[], type: Classification) {
-  const increments = Array.from({ length: 242 }, () => 0);
+  const increments = Array.from({ length: TRADING_MINUTES }, () => 0);
   for (const event of events) {
     if (event.classification !== type) continue;
     const index = Math.max(0, Math.min(241, timeIndex(event.first_touch_time)));
@@ -199,6 +233,167 @@ function buildCumulative(events: LimitEvent[], type: Classification) {
     running += increment;
     return running;
   });
+}
+
+function tradingMinuteLabel(index: number) {
+  const absolute = index <= 120 ? 570 + index : 780 + index - 121;
+  return `${String(Math.floor(absolute / 60)).padStart(2, "0")}:${String(absolute % 60).padStart(2, "0")}`;
+}
+
+function trailingAverage(values: number[], windowLength: number) {
+  const prefixSums = [0];
+  for (const value of values) {
+    prefixSums.push(prefixSums[prefixSums.length - 1] + value);
+  }
+  return values.map((_, index) => {
+    const start = Math.max(0, index - windowLength + 1);
+    const sum = Math.max(0, prefixSums[index + 1] - prefixSums[start]);
+    return sum / (index - start + 1);
+  });
+}
+
+function sealedShare(sealed: number, opened: number) {
+  const total = sealed + opened;
+  if (total <= Number.EPSILON) return null;
+  return Math.min(1, Math.max(0, sealed / total));
+}
+
+type RangeObservation = {
+  sealed: number[];
+  opened: number[];
+  sealedRate: Array<number | null>;
+  openedRate: Array<number | null>;
+  neverOpened: number[];
+  resealed: number[];
+  sealedThenOpened: number[];
+  touchedNotSealed: number[];
+  neverOpenedRate: Array<number | null>;
+  resealedRate: Array<number | null>;
+  sealedThenOpenedRate: Array<number | null>;
+  touchedNotSealedRate: Array<number | null>;
+  averageDailySealed: number;
+  averageDailyOpened: number;
+  averageMinuteSealed: number;
+  averageMinuteOpened: number;
+  overallSealedRate: number;
+  overallOpenedRate: number;
+  neverOpenedCount: number;
+  resealedCount: number;
+  sealedThenOpenedCount: number;
+  touchedNotSealedCount: number;
+  overallNeverOpenedRate: number;
+  overallResealedRate: number;
+  overallSealedThenOpenedRate: number;
+  overallTouchedNotSealedRate: number;
+  eventCount: number;
+  tradingDayCount: number;
+};
+
+function buildRangeObservation(
+  events: LimitEvent[],
+  rangeDates: string[],
+  selectedBoards: string[],
+  windowLength: number,
+): RangeObservation {
+  const dateSet = new Set(rangeDates);
+  const boardSet = new Set(selectedBoards);
+  const scoped = events.filter(
+    (event) => dateSet.has(event.date) && boardSet.has(event.board),
+  );
+  const sealedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  const openedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  const neverOpenedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  const resealedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  const sealedThenOpenedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  const touchedNotSealedSums = Array.from({ length: TRADING_MINUTES }, () => 0);
+  for (const event of scoped) {
+    const index = Math.max(
+      0,
+      Math.min(TRADING_MINUTES - 1, timeIndex(event.first_touch_time)),
+    );
+    if (event.classification === "封板") sealedSums[index] += 1;
+    else openedSums[index] += 1;
+    if (event.path_classification === "未开板封住") neverOpenedSums[index] += 1;
+    else if (event.path_classification === "开板后回封") resealedSums[index] += 1;
+    else if (event.path_classification === "封板后开板") sealedThenOpenedSums[index] += 1;
+    else touchedNotSealedSums[index] += 1;
+  }
+
+  const dayCount = Math.max(1, rangeDates.length);
+  const sealedPerMinute = sealedSums.map((value) => value / dayCount);
+  const openedPerMinute = openedSums.map((value) => value / dayCount);
+  const sealed = trailingAverage(sealedPerMinute, windowLength);
+  const opened = trailingAverage(openedPerMinute, windowLength);
+  const averagePath = (values: number[]) =>
+    trailingAverage(values.map((value) => value / dayCount), windowLength);
+  const neverOpened = averagePath(neverOpenedSums);
+  const resealed = averagePath(resealedSums);
+  const sealedThenOpened = averagePath(sealedThenOpenedSums);
+  const touchedNotSealed = averagePath(touchedNotSealedSums);
+  const sealedRate = sealed.map((value, index) => sealedShare(value, opened[index]));
+  const openedRate = sealedRate.map((rate) => (rate == null ? null : 1 - rate));
+  const neverOpenedRate = neverOpened.map((value, index) =>
+    sealedShare(value, resealed[index]),
+  );
+  const resealedRate = neverOpenedRate.map((rate) =>
+    rate == null ? null : 1 - rate,
+  );
+  const sealedThenOpenedRate = sealedThenOpened.map((value, index) =>
+    sealedShare(value, touchedNotSealed[index]),
+  );
+  const touchedNotSealedRate = sealedThenOpenedRate.map((rate) =>
+    rate == null ? null : 1 - rate,
+  );
+  const sealedTotal = scoped.filter((event) => event.classification === "封板").length;
+  const openedTotal = scoped.length - sealedTotal;
+  const neverOpenedCount = scoped.filter(
+    (event) => event.path_classification === "未开板封住",
+  ).length;
+  const resealedCount = scoped.filter(
+    (event) => event.path_classification === "开板后回封",
+  ).length;
+  const sealedThenOpenedCount = scoped.filter(
+    (event) => event.path_classification === "封板后开板",
+  ).length;
+  const touchedNotSealedCount = scoped.filter(
+    (event) => event.path_classification === "触板未封",
+  ).length;
+  const total = Math.max(1, scoped.length);
+  const sealedDenominator = Math.max(1, sealedTotal);
+  const openedDenominator = Math.max(1, openedTotal);
+  const averageDailySealed = sealedTotal / dayCount;
+  const averageDailyOpened = openedTotal / dayCount;
+
+  return {
+    sealed,
+    opened,
+    sealedRate,
+    openedRate,
+    neverOpened,
+    resealed,
+    sealedThenOpened,
+    touchedNotSealed,
+    neverOpenedRate,
+    resealedRate,
+    sealedThenOpenedRate,
+    touchedNotSealedRate,
+    averageDailySealed,
+    averageDailyOpened,
+    averageMinuteSealed: averageDailySealed / TRADING_MINUTES,
+    averageMinuteOpened: averageDailyOpened / TRADING_MINUTES,
+    overallSealedRate: sealedTotal / total,
+    overallOpenedRate: openedTotal / total,
+    neverOpenedCount,
+    resealedCount,
+    sealedThenOpenedCount,
+    touchedNotSealedCount,
+    overallNeverOpenedRate: neverOpenedCount / sealedDenominator,
+    overallResealedRate: resealedCount / sealedDenominator,
+    overallSealedThenOpenedRate: sealedThenOpenedCount / openedDenominator,
+    overallTouchedNotSealedRate: touchedNotSealedCount / openedDenominator,
+    eventCount: scoped.length,
+    tradingDayCount: rangeDates.length,
+  };
 }
 
 function CumulativeChart({ events, scope }: { events: LimitEvent[]; scope: string }) {
@@ -282,6 +477,244 @@ function CumulativeChart({ events, scope }: { events: LimitEvent[]; scope: strin
         <circle className="curve-end curve-end-sealed" cx={x(241)} cy={y(sealed.at(-1) ?? 0)} r="4" />
         <circle className="curve-end curve-end-opened" cx={x(241)} cy={y(opened.at(-1) ?? 0)} r="4" />
       </svg>
+    </div>
+  );
+}
+
+function RangeObservationChart({
+  mode,
+  observation,
+}: {
+  mode: "count" | "rate";
+  observation: RangeObservation;
+}) {
+  const [activeIndex, setActiveIndex] = useState(TRADING_MINUTES - 1);
+  const width = 760;
+  const height = 360;
+  const margin = { left: 54, right: 28, top: 28, bottom: 50 };
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+  const sealed = mode === "count" ? observation.sealed : observation.sealedRate;
+  const opened = mode === "count" ? observation.opened : observation.openedRate;
+  const referenceSealed =
+    mode === "count" ? observation.averageMinuteSealed : observation.overallSealedRate;
+  const referenceOpened =
+    mode === "count" ? observation.averageMinuteOpened : observation.overallOpenedRate;
+  const numericValues = [...sealed, ...opened].filter(
+    (value): value is number => value != null && Number.isFinite(value),
+  );
+  const maxValue =
+    mode === "rate"
+      ? 1
+      : Math.max(1, referenceSealed, referenceOpened, ...numericValues) * 1.08;
+  const x = (index: number) => margin.left + (index / (TRADING_MINUTES - 1)) * innerWidth;
+  const y = (value: number) => margin.top + innerHeight - (value / maxValue) * innerHeight;
+  const path = (values: Array<number | null>) => {
+    let drawing = false;
+    return values
+      .map((value, index) => {
+        if (value == null) {
+          drawing = false;
+          return "";
+        }
+        const command = drawing ? "L" : "M";
+        drawing = true;
+        return `${command} ${x(index)} ${y(value)}`;
+      })
+      .join(" ");
+  };
+  const yTicks =
+    mode === "rate"
+      ? [0, 0.25, 0.5, 0.75, 1]
+      : Array.from(new Set([0, maxValue / 2, maxValue]));
+  const xTicks = [0, 30, 60, 90, 120, 121, 151, 181, 211, 241];
+  const activeSealed = sealed[activeIndex];
+  const activeOpened = opened[activeIndex];
+
+  const updateActiveIndex = (clientX: number, svg: SVGSVGElement) => {
+    const bounds = svg.getBoundingClientRect();
+    const chartX = ((clientX - bounds.left) / bounds.width) * width;
+    const index = Math.round(
+      ((chartX - margin.left) / innerWidth) * (TRADING_MINUTES - 1),
+    );
+    setActiveIndex(Math.max(0, Math.min(TRADING_MINUTES - 1, index)));
+  };
+  const formatValue = (value: number | null | undefined) => {
+    if (value == null) return "—";
+    return mode === "rate"
+      ? formatPercent(value)
+      : value < 1
+        ? value.toFixed(2)
+        : value.toFixed(1);
+  };
+
+  return (
+    <div className="range-chart-wrap">
+      <svg
+        className="range-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={mode === "count" ? "区间每分钟日均封板与开板数量曲线" : "区间每分钟封板与开板占比曲线"}
+        onPointerMove={(event) => updateActiveIndex(event.clientX, event.currentTarget)}
+        onPointerLeave={() => setActiveIndex(TRADING_MINUTES - 1)}
+      >
+        <title>{mode === "count" ? "区间每分钟日均数量" : "区间每分钟占比"}</title>
+        <desc>每个点只统计对应分钟滑动窗口内的事件；实线为窗口平均，虚线为所选日期范围的全日每分钟均值或总体占比参考。</desc>
+        {yTicks.map((tick) => (
+          <g key={tick}>
+            <line className="range-grid" x1={margin.left} x2={width - margin.right} y1={y(tick)} y2={y(tick)} />
+            <text className="range-axis-label" x={margin.left - 10} y={y(tick) + 4} textAnchor="end">
+              {mode === "rate" ? `${Math.round(tick * 100)}%` : tick.toFixed(tick < 10 ? 1 : 0)}
+            </text>
+          </g>
+        ))}
+        <line className="range-lunch-line" x1={x(120.5)} x2={x(120.5)} y1={margin.top} y2={height - margin.bottom} />
+        {xTicks.map((index) => (
+          <text
+            key={index}
+            className="range-axis-label range-time-label"
+            x={x(index)}
+            y={height - 20}
+            textAnchor={index === 0 ? "start" : index === TRADING_MINUTES - 1 ? "end" : "middle"}
+          >
+            {tradingMinuteLabel(index)}
+          </text>
+        ))}
+        <line className="range-reference range-reference-sealed" x1={margin.left} x2={width - margin.right} y1={y(referenceSealed)} y2={y(referenceSealed)} />
+        <line className="range-reference range-reference-opened" x1={margin.left} x2={width - margin.right} y1={y(referenceOpened)} y2={y(referenceOpened)} />
+        <path className="range-line range-line-sealed" d={path(sealed)} />
+        <path className="range-line range-line-opened" d={path(opened)} />
+        <g className="range-cursor">
+          <line x1={x(activeIndex)} x2={x(activeIndex)} y1={margin.top} y2={height - margin.bottom} />
+          {activeSealed != null && <circle className="range-point-sealed" cx={x(activeIndex)} cy={y(activeSealed)} r="4" />}
+          {activeOpened != null && <circle className="range-point-opened" cx={x(activeIndex)} cy={y(activeOpened)} r="4" />}
+        </g>
+      </svg>
+      <div className="range-readout" aria-live="polite">
+        <strong>{tradingMinuteLabel(activeIndex)}</strong>
+        <span className="sealed-value">封板 {mode === "count" ? "日均 " : ""}{formatValue(activeSealed)}</span>
+        <span className="opened-value">开板 {mode === "count" ? "日均 " : ""}{formatValue(activeOpened)}</span>
+      </div>
+    </div>
+  );
+}
+
+function PathStackedChart({
+  kind,
+  observation,
+}: {
+  kind: "sealed" | "opened";
+  observation: RangeObservation;
+}) {
+  const [activeIndex, setActiveIndex] = useState(TRADING_MINUTES - 1);
+  const width = 760;
+  const height = 360;
+  const margin = { left: 54, right: 28, top: 28, bottom: 50 };
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+  const barWidth = innerWidth / TRADING_MINUTES;
+  const first =
+    kind === "sealed"
+      ? observation.neverOpenedRate
+      : observation.sealedThenOpenedRate;
+  const second =
+    kind === "sealed"
+      ? observation.resealedRate
+      : observation.touchedNotSealedRate;
+  const firstLabel = kind === "sealed" ? "未开板封住" : "封板后开板";
+  const secondLabel = kind === "sealed" ? "开板后回封" : "触板未封";
+  const firstColor = kind === "sealed" ? NEVER_OPENED : SEALED_THEN_OPENED;
+  const secondColor = kind === "sealed" ? RESEALED : TOUCHED_NOT_SEALED;
+  const overallFirst =
+    kind === "sealed"
+      ? observation.overallNeverOpenedRate
+      : observation.overallSealedThenOpenedRate;
+  const x = (index: number) => margin.left + index * barWidth;
+  const y = (value: number) => margin.top + innerHeight - value * innerHeight;
+  const xTicks = [0, 30, 60, 90, 120, 121, 151, 181, 211, 241];
+  const activeFirst = first[activeIndex];
+  const activeSecond = second[activeIndex];
+
+  const updateActiveIndex = (clientX: number, svg: SVGSVGElement) => {
+    const bounds = svg.getBoundingClientRect();
+    const chartX = ((clientX - bounds.left) / bounds.width) * width;
+    const index = Math.floor((chartX - margin.left) / barWidth);
+    setActiveIndex(Math.max(0, Math.min(TRADING_MINUTES - 1, index)));
+  };
+
+  return (
+    <div className="range-chart-wrap">
+      <svg
+        className="range-chart path-stacked-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={`${kind === "sealed" ? "封板" : "开板"}路径每分钟比例堆叠图`}
+        onPointerMove={(event) => updateActiveIndex(event.clientX, event.currentTarget)}
+        onPointerLeave={() => setActiveIndex(TRADING_MINUTES - 1)}
+      >
+        <title>{kind === "sealed" ? "封板路径构成" : "开板路径构成"}</title>
+        <desc>每个交易分钟按当前滑动窗口计算两类路径在对应封板或开板事件中的构成，两类比例之和为百分之百。</desc>
+        {[0, 0.25, 0.5, 0.75, 1].map((tick) => (
+          <g key={tick}>
+            <line className="range-grid" x1={margin.left} x2={width - margin.right} y1={y(tick)} y2={y(tick)} />
+            <text className="range-axis-label" x={margin.left - 10} y={y(tick) + 4} textAnchor="end">
+              {Math.round(tick * 100)}%
+            </text>
+          </g>
+        ))}
+        {first.map((firstRate, index) => {
+          if (firstRate == null || second[index] == null) return null;
+          return (
+            <g key={index}>
+              <rect
+                x={x(index)}
+                y={y(firstRate)}
+                width={barWidth + 0.35}
+                height={innerHeight * firstRate}
+                fill={firstColor}
+              />
+              <rect
+                x={x(index)}
+                y={margin.top}
+                width={barWidth + 0.35}
+                height={innerHeight * (second[index] ?? 0)}
+                fill={secondColor}
+              />
+            </g>
+          );
+        })}
+        <line
+          className="path-reference"
+          x1={margin.left}
+          x2={width - margin.right}
+          y1={y(overallFirst)}
+          y2={y(overallFirst)}
+        />
+        <line className="range-lunch-line" x1={x(121)} x2={x(121)} y1={margin.top} y2={height - margin.bottom} />
+        {xTicks.map((index) => (
+          <text
+            key={index}
+            className="range-axis-label range-time-label"
+            x={x(index)}
+            y={height - 20}
+            textAnchor={index === 0 ? "start" : index === TRADING_MINUTES - 1 ? "end" : "middle"}
+          >
+            {tradingMinuteLabel(index)}
+          </text>
+        ))}
+        <line
+          className="path-cursor"
+          x1={x(activeIndex) + barWidth / 2}
+          x2={x(activeIndex) + barWidth / 2}
+          y1={margin.top}
+          y2={height - margin.bottom}
+        />
+      </svg>
+      <div className="range-readout path-readout" aria-live="polite">
+        <strong>{tradingMinuteLabel(activeIndex)}</strong>
+        <span style={{ color: firstColor }}>{firstLabel} {activeFirst == null ? "—" : formatPercent(activeFirst)}</span>
+        <span style={{ color: kind === "sealed" ? "#5d91b5" : "#c77d69" }}>{secondLabel} {activeSecond == null ? "—" : formatPercent(activeSecond)}</span>
+      </div>
     </div>
   );
 }
@@ -439,6 +872,10 @@ export default function Dashboard() {
   const [base64MinuteDates, setBase64MinuteDates] = useState<Set<string>>(new Set());
   const [minuteLoading, setMinuteLoading] = useState(false);
   const [minuteError, setMinuteError] = useState("");
+  const [rangeStart, setRangeStart] = useState("");
+  const [rangeEnd, setRangeEnd] = useState("");
+  const [rangeBoards, setRangeBoards] = useState<string[]>([]);
+  const [windowLength, setWindowLength] = useState(5);
 
   useEffect(() => {
     let active = true;
@@ -466,9 +903,13 @@ export default function Dashboard() {
         const inflated = inflatePayload(payload);
         setEvents(inflated);
         setDates(payload.dates);
-        setBoards(payload.boards ?? [...new Set(inflated.map((event) => event.board))]);
+        const availableBoards = payload.boards ?? [...new Set(inflated.map((event) => event.board))];
+        setBoards(availableBoards);
         setBase64MinuteDates(new Set(payload.base64_minute_dates ?? []));
+        setRangeBoards(availableBoards);
         setSelectedDate(payload.dates.at(-1) ?? "");
+        setRangeStart(payload.dates.at(-20) ?? payload.dates[0] ?? "");
+        setRangeEnd(payload.dates.at(-1) ?? "");
       })
       .catch((reason: Error) => active && setError(reason.message));
     return () => {
@@ -508,7 +949,9 @@ export default function Dashboard() {
     fetch(minutePath, { signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error(`分钟行情请求失败：${response.status}`);
-        return usesBase64 ? response.text().then(decodeBase64Buffer) : response.arrayBuffer();
+        return usesBase64
+          ? response.text().then(decodeBase64Buffer)
+          : response.arrayBuffer();
       })
       .then((payload) => setMinuteStocks(inflateMinutePayload(payload)))
       .catch((reason: Error) => {
@@ -566,6 +1009,14 @@ export default function Dashboard() {
   const totalPages = Math.max(1, Math.ceil(filteredEvents.length / PAGE_SIZE));
   const visibleEvents = filteredEvents.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
   const dateIndex = dates.indexOf(selectedDate);
+  const rangeDates = useMemo(
+    () => dates.filter((date) => date >= rangeStart && date <= rangeEnd),
+    [dates, rangeEnd, rangeStart],
+  );
+  const rangeObservation = useMemo(
+    () => buildRangeObservation(events, rangeDates, rangeBoards, windowLength),
+    [events, rangeBoards, rangeDates, windowLength],
+  );
 
   const chooseInputDate = (value: string) => {
     const compact = compactDate(value);
@@ -575,6 +1026,35 @@ export default function Dashboard() {
     }
     const next = dates.find((date) => date >= compact) ?? dates.at(-1);
     if (next) setSelectedDate(next);
+  };
+
+  const nearestTradingDate = (value: string) => {
+    const compact = compactDate(value);
+    return dates.reduce((nearest, date) =>
+      Math.abs(Number(date) - Number(compact)) < Math.abs(Number(nearest) - Number(compact))
+        ? date
+        : nearest,
+    dates[0]);
+  };
+
+  const chooseRangeDate = (edge: "start" | "end", value: string) => {
+    const next = nearestTradingDate(value);
+    if (edge === "start") {
+      setRangeStart(next);
+      if (next > rangeEnd) setRangeEnd(next);
+    } else {
+      setRangeEnd(next);
+      if (next < rangeStart) setRangeStart(next);
+    }
+  };
+
+  const toggleRangeBoard = (board: string) => {
+    setRangeBoards((current) => {
+      if (current.includes(board)) {
+        return current.length === 1 ? current : current.filter((item) => item !== board);
+      }
+      return boards.filter((item) => current.includes(item) || item === board);
+    });
   };
 
   if (error) {
@@ -739,6 +1219,206 @@ export default function Dashboard() {
             </div>
           </dl>
         </aside>
+      </section>
+
+      <section className="panel observation-panel" id="range-observation">
+        <div className="panel-heading observation-heading">
+          <div>
+            <span className="panel-kicker">RANGE OBSERVATION</span>
+            <h2>区间涨停节奏观察</h2>
+            <p>逐分钟对齐所选交易日，每个点仅统计对应滑动窗口内的新封板与新开板事件，不做日内累计</p>
+          </div>
+          <div className="observation-summary" aria-label="当前区间摘要">
+            <strong>{rangeObservation.tradingDayCount}</strong>
+            <span>个交易日</span>
+            <i aria-hidden="true" />
+            <strong>{rangeObservation.eventCount.toLocaleString("zh-CN")}</strong>
+            <span>次触板</span>
+          </div>
+        </div>
+
+        <div className="observation-controls">
+          <fieldset className="range-date-control">
+            <legend>日期区间</legend>
+            <label>
+              <span>开始</span>
+              <input
+                type="date"
+                value={dateInputValue(rangeStart)}
+                min={dateInputValue(dates[0])}
+                max={dateInputValue(rangeEnd)}
+                onChange={(event) => chooseRangeDate("start", event.target.value)}
+              />
+            </label>
+            <span className="date-separator" aria-hidden="true">—</span>
+            <label>
+              <span>结束</span>
+              <input
+                type="date"
+                value={dateInputValue(rangeEnd)}
+                min={dateInputValue(rangeStart)}
+                max={dateInputValue(dates.at(-1) ?? dates[0])}
+                onChange={(event) => chooseRangeDate("end", event.target.value)}
+              />
+            </label>
+          </fieldset>
+
+          <fieldset className="window-control">
+            <legend>分钟移动平均窗口</legend>
+            <div>
+              <input
+                type="range"
+                min="1"
+                max="60"
+                step="1"
+                value={windowLength}
+                aria-label="分钟移动平均窗口长度"
+                onChange={(event) => setWindowLength(Number(event.target.value))}
+              />
+              <output>{windowLength} 分钟</output>
+            </div>
+          </fieldset>
+
+          <fieldset className="range-board-control">
+            <legend>板块（可多选）</legend>
+            <div>
+              {boards.map((board) => (
+                <button
+                  key={board}
+                  type="button"
+                  className={rangeBoards.includes(board) ? "active" : ""}
+                  aria-pressed={rangeBoards.includes(board)}
+                  onClick={() => toggleRangeBoard(board)}
+                >
+                  {board}
+                </button>
+              ))}
+              <button
+                type="button"
+                className={rangeBoards.length === boards.length ? "active" : ""}
+                onClick={() => setRangeBoards(boards)}
+              >
+                全选
+              </button>
+            </div>
+          </fieldset>
+        </div>
+
+        <div className="range-charts-grid">
+          <article className="range-chart-card">
+            <div className="range-chart-heading">
+              <div>
+                <span>AVERAGE COUNT</span>
+                <h3>封板 / 开板每分钟日均数量</h3>
+              </div>
+              <div className="range-reference-legend">
+                <span className="sealed-value">封板 {rangeObservation.averageMinuteSealed.toFixed(2)}/分钟 · {rangeObservation.averageDailySealed.toFixed(1)}/日</span>
+                <span className="opened-value">开板 {rangeObservation.averageMinuteOpened.toFixed(2)}/分钟 · {rangeObservation.averageDailyOpened.toFixed(1)}/日</span>
+              </div>
+            </div>
+            <RangeObservationChart mode="count" observation={rangeObservation} />
+          </article>
+
+          <article className="range-chart-card">
+            <div className="range-chart-heading">
+              <div>
+                <span>AVERAGE SHARE</span>
+                <h3>封板 / 开板每分钟占比</h3>
+              </div>
+              <div className="range-reference-legend">
+                <span className="sealed-value">封板基准 {formatPercent(rangeObservation.overallSealedRate)}</span>
+                <span className="opened-value">开板基准 {formatPercent(rangeObservation.overallOpenedRate)}</span>
+              </div>
+            </div>
+            <RangeObservationChart mode="rate" observation={rangeObservation} />
+          </article>
+
+          <article className="range-chart-card path-chart-card">
+            <div className="range-chart-heading">
+              <div>
+                <span>SEALED PATH MIX</span>
+                <h3>封板两类每分钟比例堆叠</h3>
+              </div>
+              <div className="path-legend">
+                <span><i style={{ background: NEVER_OPENED }} />未开板封住 {formatPercent(rangeObservation.overallNeverOpenedRate)}</span>
+                <span><i style={{ background: RESEALED }} />开板后回封 {formatPercent(rangeObservation.overallResealedRate)}</span>
+              </div>
+            </div>
+            <PathStackedChart kind="sealed" observation={rangeObservation} />
+          </article>
+
+          <article className="range-chart-card path-chart-card">
+            <div className="range-chart-heading">
+              <div>
+                <span>OPENED PATH MIX</span>
+                <h3>开板两类每分钟比例堆叠</h3>
+              </div>
+              <div className="path-legend">
+                <span><i style={{ background: SEALED_THEN_OPENED }} />封板后开板 {formatPercent(rangeObservation.overallSealedThenOpenedRate)}</span>
+                <span><i style={{ background: TOUCHED_NOT_SEALED }} />触板未封 {formatPercent(rangeObservation.overallTouchedNotSealedRate)}</span>
+              </div>
+            </div>
+            <PathStackedChart kind="opened" observation={rangeObservation} />
+          </article>
+        </div>
+
+        <section className="path-statistics" aria-labelledby="path-statistics-title">
+          <div className="path-statistics-heading">
+            <div>
+              <span>PATH STATISTICS</span>
+              <h3 id="path-statistics-title">所选区间路径统计</h3>
+            </div>
+            <p>比例分别以封板总数或开板总数为分母</p>
+          </div>
+          <div className="path-stats-grid">
+            {[
+              {
+                label: "未开板封住",
+                count: rangeObservation.neverOpenedCount,
+                rate: rangeObservation.overallNeverOpenedRate,
+                color: NEVER_OPENED,
+                parent: "封板",
+              },
+              {
+                label: "开板后回封",
+                count: rangeObservation.resealedCount,
+                rate: rangeObservation.overallResealedRate,
+                color: RESEALED,
+                parent: "封板",
+              },
+              {
+                label: "封板后开板",
+                count: rangeObservation.sealedThenOpenedCount,
+                rate: rangeObservation.overallSealedThenOpenedRate,
+                color: SEALED_THEN_OPENED,
+                parent: "开板",
+              },
+              {
+                label: "触板未封",
+                count: rangeObservation.touchedNotSealedCount,
+                rate: rangeObservation.overallTouchedNotSealedRate,
+                color: TOUCHED_NOT_SEALED,
+                parent: "开板",
+              },
+            ].map((stat) => (
+              <article key={stat.label} style={{ "--path-color": stat.color } as CSSProperties}>
+                <span>{stat.label}</span>
+                <strong>{stat.count.toLocaleString("zh-CN")}</strong>
+                <div>
+                  <b>{formatPercent(stat.rate)}</b>
+                  <small>占{stat.parent} · 日均 {(stat.count / Math.max(1, rangeObservation.tradingDayCount)).toFixed(1)}</small>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <footer className="observation-note">
+          <span><i className="solid-sample" />实线：{windowLength} 分钟窗口内的每分钟日均值</span>
+          <span><i className="dashed-sample" />虚线：全日每分钟均值 / 区间总体占比</span>
+          <span>早盘至午间休市、午后开盘按实际交易分钟连续对齐</span>
+          <span>“中途开板”按首次分钟收盘封板后的后续分钟最低价低于涨停价判定</span>
+        </footer>
       </section>
 
       <section className="panel stock-panel" id="stock-analysis">
